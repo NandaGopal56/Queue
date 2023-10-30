@@ -8,7 +8,7 @@ LOG_FORMAT = ('%(levelname) -10s %(asctime)s %(name) -30s %(funcName) '
               '-35s %(lineno) -5d: %(message)s')
 LOGGER = logging.getLogger(__name__)
 
-class RibbitMQPublisher(object):
+class RabbitMQPublisher(object):
     EXCHANGE = 'message'
     EXCHANGE_TYPE = ExchangeType.topic
     PUBLISH_INTERVAL = 1
@@ -262,3 +262,103 @@ class RibbitMQPublisher(object):
 
         LOGGER.info(f'Published {self._message_number} messages, {len(self._deliveries)} have yet to be confirmed, \
                     {self._acked} were acked and {self._nacked} were nacked')
+
+    def schedule_next_message(self):
+        """If we are not closing our connection to RabbitMQ, schedule another
+        message to be delivered in PUBLISH_INTERVAL seconds.
+
+        """
+        LOGGER.info(f'Scheduling next message for {self.PUBLISH_INTERVAL} seconds')
+        self._connection.ioloop.call_later(self.PUBLISH_INTERVAL, self.publish_message)
+
+    def publish_message(self):
+        """If the class is not stopping, publish a message to RabbitMQ,
+        appending a list of deliveries with the message number that was sent.
+        This list will be used to check for delivery confirmations in the
+        on_delivery_confirmations method.
+
+        Once the message has been sent, schedule another message to be sent.
+        The main reason I put scheduling in was just so you can get a good idea
+        of how the process is flowing by slowing down and speeding up the
+        delivery intervals by changing the PUBLISH_INTERVAL constant in the
+        class.
+
+        """
+        if self._channel is None or not self._channel.is_open:
+            return
+
+        properties = pika.BasicProperties(app_id='example-publisher',
+                                          content_type='application/json')
+
+        message = u'This is a test message for testing Order Queue'
+        self._channel.basic_publish(self.EXCHANGE, self.ROUTING_KEY,
+                                    json.dumps(message, ensure_ascii=False),
+                                    properties)
+        self._message_number += 1
+        self._deliveries[self._message_number] = True
+        LOGGER.info('Published message # %i', self._message_number)
+        self.schedule_next_message()
+    
+    def run(self):
+        """Run the example code by connecting and then starting the IOLoop.
+
+        """
+        while not self._stopping:
+            self._connection = None
+            self._deliveries = {}
+            self._acked = 0
+            self._nacked = 0
+            self._message_number = 0
+
+            try:
+                self._connection = self.connect()
+                self._connection.ioloop.start()
+            except KeyboardInterrupt:
+                self.stop()
+                if (self._connection is not None and
+                        not self._connection.is_closed):
+                    self._connection.ioloop.start()
+
+        LOGGER.info('Stopped')
+    
+    def stop(self):
+        """Stop the example by closing the channel and connection. We
+        set a flag here so that we stop scheduling new messages to be
+        published. The IOLoop is started because this method is
+        invoked by the Try/Catch below when KeyboardInterrupt is caught.
+        Starting the IOLoop again will allow the publisher to cleanly
+        disconnect from RabbitMQ.
+
+        """
+        LOGGER.info('Stopping')
+        self._stopping = True
+        self.close_channel()
+        self.close_connection()
+
+    def close_channel(self):
+        """Invoke this command to close the channel with RabbitMQ by sending
+        the Channel.Close RPC command.
+
+        """
+        if self._channel is not None:
+            LOGGER.info('Closing the channel')
+            self._channel.close()
+
+    def close_connection(self):
+        """This method closes the connection to RabbitMQ."""
+        if self._connection is not None:
+            LOGGER.info('Closing connection')
+            self._connection.close()
+    
+def main():
+    logging.basicConfig(level=logging.DEBUG, format=LOG_FORMAT)
+
+    # Connect to localhost:5672 as guest with the password guest and virtual host "/" (%2F)
+    example = RabbitMQPublisher(
+        'amqp://guest:guest@localhost:5672/%2F?connection_attempts=3&heartbeat=3600'
+    )
+    example.run()
+
+
+if __name__ == '__main__':
+    main()
